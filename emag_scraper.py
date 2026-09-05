@@ -2,8 +2,8 @@
 """
 eMAG 后台商品数据抓取脚本
 ==========================
-原理：模拟浏览器向 eMAG 后台接口循环发送 POST 请求，逐页抓取商品数据，
-      每抓完一页立刻追加写入 JSON 文件（标准 JSON 数组格式：[{...}, {...}]），
+原理：模拟浏览器向 eMAG 后台接口循环发送 POST 请求，按"批次并发"抓取商品数据
+      （每批 CONCURRENCY 页同时请求，主线程按页码顺序追加写入 JSON 文件），
       中途断掉重新运行即可接着抓，已抓到的数据不会丢。
 
 使用前准备：
@@ -13,18 +13,21 @@ eMAG 后台商品数据抓取脚本
 3. 运行：      python emag_scraper.py
 """
 
+import glob
 import json
 import math
 import os
 import random
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from scrapling.fetchers import Fetcher
 
 # ==================== 一、配置区（按需修改） ====================
 
-VERSION = '1.0.0'      # 程序版本号
+VERSION = '1.0.1'      # 程序版本号
 
 API_URL = 'https://marketplace.emag.ro/api-ui/opportunities/'
 
@@ -33,11 +36,13 @@ PER_PAGE = 100       # 每页条数。实测服务端接受 100 条/页：100 �
 MAX_PAGE = 200        # 翻页安全上限（当前是测试值：只抓 5 页验证效果）。
                     # 接口会返回总页数，脚本抓满会自动停止；测试没问题后改成 10000 再正式开跑
 RESUME = False       # 断点续传开关：True = 从上次进度继续抓；False = 清空旧数据、从第 1 页重新抓
+CONCURRENCY = 5     # 并发数量：同时请求的页面数（一批请求的页数）。1 = 单线程模式；
+                    # 5 = 每批同时抓 5 页；想调节抓取速度只改这个数字即可
 MAX_RETRIES = 2     # 每一页失败后的重试次数（登录失效不重试，会直接提示并停止）
-SLEEP_MIN = 1.5     # 每页之间随机暂停的最小秒数
-SLEEP_MAX = 3.5     # 每页之间随机暂停的最大秒数
+SLEEP_MIN = 1.5     # 每批并发请求之间的随机暂停最小秒数（V1.0.1 起按"批"暂停，不再是每页暂停）
+SLEEP_MAX = 3.5     # 每批并发请求之间的随机暂停最大秒数
 
-JSON_FILE = 'emag_products.json'    # 数据保存的文件名（标准 JSON 数组格式：[{...}, {...}, ...]）
+JSON_FILE = ''      # 输出文件名：程序启动时按 {YYYYMMDD_HHMMSS}_{PER_PAGE}_{MAX_PAGE}.json 动态生成
 PROGRESS_FILE = 'progress.txt'      # 断点续传进度文件（记录已抓完的页码）
 ERROR_LOG = 'error_log.txt'         # 失败页码的日志文件
 COOKIE_FILE = 'cookies.txt'         # 存放 Cookie 的文件（Cookie 过期后替换里面内容即可）
@@ -81,6 +86,17 @@ FIELD_MAP = {
     'PN': ['part_number', 'part_number_key'],
     'Image_URL': ['image', 'image_url', 'main_image'],
 }
+
+
+def sanitize_concurrency():
+    """保护 CONCURRENCY 配置：非正整数时自动按 1（单线程）处理并打印提示，不让程序崩溃"""
+    global CONCURRENCY
+    if not isinstance(CONCURRENCY, int) or CONCURRENCY < 1:
+        print(f'[提示] CONCURRENCY={CONCURRENCY!r} 无效（必须为 >= 1 的整数），已自动按 1 处理（单线程模式）。')
+        CONCURRENCY = 1
+
+
+sanitize_concurrency()
 
 
 # ==================== 二、Cookie 加载 ====================
@@ -231,6 +247,23 @@ def extract_row(item, page):
 
 # ==================== 五、保存与断点续传 ====================
 
+def build_json_filename():
+    """生成本次运行的输出文件名：{YYYYMMDD_HHMMSS}_{PER_PAGE}_{MAX_PAGE}.json
+    只在任务开始时调用一次，整个任务期间保持不变（不会每保存一页重新生成）"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f'{timestamp}_{PER_PAGE}_{MAX_PAGE}.json'
+
+
+def find_latest_json():
+    """断点续传用：在当前目录找最近一次与本配置（PER_PAGE + MAX_PAGE）匹配的抓取结果文件。
+    只认 {YYYYMMDD_HHMMSS}_{PER_PAGE}_{MAX_PAGE}.json 格式的文件，
+    文件名里的时间戳格式固定，字符串排序即时间顺序，取最大（最新）的一个；找不到返回 None"""
+    pattern = f'*_{PER_PAGE}_{MAX_PAGE}.json'
+    candidates = [name for name in glob.glob(pattern)
+                  if re.fullmatch(r'\d{8}_\d{6}_\d+_\d+\.json', name)]
+    return max(candidates) if candidates else None
+
+
 def save_page(rows):
     """把一页的数据立即追加写入 JSON 文件（标准 JSON 数组格式，不会内存溢出）"""
     # 判断文件是否已有数据（不存在、或只有 "[" 开头，都按新文件处理）
@@ -267,7 +300,8 @@ def save_progress(page):
 
 
 def reset_data_files():
-    """清空旧数据文件，用于"从头开始抓"（RESUME = False 时调用）"""
+    """从头开始抓（RESUME = False）时清理本次运行的状态文件。
+    注意：只清理进度文件和错误日志；历史 JSON 文件名带时间戳，一律不删除"""
     for file in (JSON_FILE, PROGRESS_FILE, ERROR_LOG):
         if os.path.exists(file):
             os.remove(file)
@@ -313,9 +347,11 @@ def record_error(page, message):
         f.write(line)
 
 
-# ==================== 六、单页请求（含重试，绝不中断程序） ====================
+# ==================== 六、单页请求（工作线程内执行，含重试，绝不中断程序） ====================
 
-consecutive_403 = 0   # 连续收到 403 的次数（403 通常是 Cookie 过期）
+# 连续收到 403 的次数（403 通常是 Cookie 过期）。
+# 注意：并发模式下此变量只由主线程读写，工作线程通过返回值上报状态码，避免多线程竞争
+consecutive_403 = 0
 
 
 def looks_like_login_page(resp):
@@ -331,9 +367,12 @@ def looks_like_login_page(resp):
 
 
 def fetch_page(page, cookie):
-    """请求某一页。
-    返回 (结果, 数据)：结果 'ok'=成功 / 'login_expired'=登录失效 / 'failed'=失败"""
-    global consecutive_403
+    """请求某一页（在工作线程里执行，不写任何共享状态、不写任何文件）。
+    返回 dict：
+      result: 'ok'=成功 / 'login_expired'=登录失效 / 'failed'=失败
+      data:   解析后的响应 JSON（仅 result='ok' 时有值）
+      error:  失败原因描述（由主线程统一写入 error_log.txt）
+      status: 最后一次响应的状态码（由主线程统一统计 403 次数）"""
     last_status = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -350,28 +389,18 @@ def fetch_page(page, cookie):
 
             # 接口跳转（302 等）= 登录失效，重试也没用，直接报告
             if status in (301, 302, 303, 307, 308):
-                print('!!! 接口返回跳转，说明登录已失效（Cookie 过期）。')
-                print('!!! 请重新复制 Cookie 覆盖 cookies.txt，然后重启脚本（已抓数据不会丢）。')
-                record_error(page, '登录失效（接口跳转到登录页）')
-                return 'login_expired', None
+                return {'result': 'login_expired', 'data': None,
+                        'error': '登录失效（接口跳转到登录页）', 'status': status}
 
             if status == 200:
-                consecutive_403 = 0
                 try:
-                    return 'ok', safe_json(resp)
+                    return {'result': 'ok', 'data': safe_json(resp),
+                            'error': None, 'status': status}
                 except Exception:
                     # 状态码 200 但解析不出 JSON：再确认是不是返回了登录页
                     if looks_like_login_page(resp):
-                        print('!!! 接口返回的是登录页，说明登录已失效（Cookie 过期）。')
-                        print('!!! 请重新复制 Cookie 覆盖 cookies.txt，然后重启脚本（已抓数据不会丢）。')
-                        record_error(page, '登录失效（返回登录页）')
-                        return 'login_expired', None
-
-            if status == 403:
-                consecutive_403 += 1
-                if consecutive_403 >= 3:
-                    print('!!! 连续收到 403，Cookie 很可能已过期。')
-                    print('!!! 请重新复制 Cookie 覆盖 cookies.txt，然后重启脚本（已抓数据不会丢）。')
+                        return {'result': 'login_expired', 'data': None,
+                                'error': '登录失效（返回登录页）', 'status': status}
 
             if attempt < MAX_RETRIES:
                 print(f'[重试] 第 {page} 页返回状态码 {status}，第 {attempt}/{MAX_RETRIES} 次重试...')
@@ -381,28 +410,60 @@ def fetch_page(page, cookie):
                 print(f'[重试] 第 {page} 页网络异常：{exc}，第 {attempt}/{MAX_RETRIES} 次重试...')
                 time.sleep(random.uniform(3, 6))
             else:
-                record_error(page, f'异常：{exc}')
-                return 'failed', None
-    record_error(page, f'状态码 {last_status}，重试 {MAX_RETRIES} 次仍失败')
-    return 'failed', None
+                return {'result': 'failed', 'data': None,
+                        'error': f'异常：{exc}', 'status': last_status}
+    return {'result': 'failed', 'data': None,
+            'error': f'状态码 {last_status}，重试 {MAX_RETRIES} 次仍失败', 'status': last_status}
+
+
+def fetch_batch(pages, cookie, executor):
+    """并发抓取一批页面：一次只把本批（数量 = CONCURRENCY）提交到线程池，
+    等待全部完成后返回 {页码: 结果}。绝不一次性提交全部任务"""
+    futures = {executor.submit(fetch_page, page, cookie): page for page in pages}
+    results = {}
+    for future in as_completed(futures):
+        page = futures[future]
+        results[page] = future.result()   # fetch_page 内部已兜底，不会抛异常
+        print(f'[请求完成] 第 {page} 页')
+    return results
 
 
 # ==================== 七、主程序 ====================
 
 def main():
+    global JSON_FILE, consecutive_403
+
+    # ---- 第一步：确定本次输出文件（时间戳命名，任务期间保持不变）----
+    if RESUME:
+        latest = find_latest_json()
+        if latest:
+            JSON_FILE = latest
+            print(f'断点续传：找到最近一次抓取文件 {JSON_FILE}')
+        else:
+            JSON_FILE = build_json_filename()
+            print(f'断点续传：未找到与当前配置（PER_PAGE={PER_PAGE}，MAX_PAGE={MAX_PAGE}）匹配的历史文件，'
+                  f'将新建文件从头开始')
+            if os.path.exists(PROGRESS_FILE):
+                os.remove(PROGRESS_FILE)   # 旧进度是其他配置留下的，清理掉避免错位续传
+    else:
+        JSON_FILE = build_json_filename()
+        reset_data_files()
+        print('已清理本次运行的进度状态，从第 1 页开始抓取。（历史时间戳 JSON 文件不会被删除）')
+
+    # ---- 第二步：启动信息 ----
     print('=' * 60)
-    print('eMAG 商品数据抓取脚本')
-    print(f'每页请求 {PER_PAGE} 条 | 翻页上限 {MAX_PAGE} 页 | 页间隔随机暂停 {SLEEP_MIN}~{SLEEP_MAX} 秒')
-    print(f'断点续传：{"开（从上次进度继续）" if RESUME else "关（从头开始抓）"} | 输出文件：{JSON_FILE}')
+    print(f'eMAG 商品数据抓取脚本 V{VERSION}')
+    print(f'每页请求：{PER_PAGE} 条')
+    print(f'最大抓取页数：{MAX_PAGE}')
+    print(f'并发数量：{CONCURRENCY}')
+    print(f'批次间隔：{SLEEP_MIN}~{SLEEP_MAX} 秒')
+    print(f'断点续传：{"开（从上次进度继续）" if RESUME else "关（从头开始抓）"}')
+    print(f'输出文件：{JSON_FILE}')
     print('=' * 60)
 
     cookie = load_cookie()
     if cookie is None:
         return
-
-    if not RESUME:
-        reset_data_files()
-        print('已清空旧数据文件，从第 1 页开始抓取。')
 
     start_page = get_start_page()
     if start_page > 1:
@@ -412,67 +473,106 @@ def main():
 
     page = start_page
     total_saved = 0
-    empty_streak = 0      # 连续找不到商品列表的次数
+    empty_streak = 0        # 连续找不到商品列表的次数
+    total_pages = None      # 接口返回的总页数（读到后不再创建超出它的批次）
     start_time = time.time()
     finished = False
+    login_expired = False
 
     try:
-        while page <= MAX_PAGE:
-            result, data = fetch_page(page, cookie)
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+            while page <= MAX_PAGE:
+                # 已知总页数后，不再创建超出总页数的新批次
+                if total_pages and page > total_pages:
+                    print(f'已达到接口返回的总页数（{total_pages} 页），抓取完成！')
+                    finished = True
+                    break
 
-            # 登录失效：重试没用，直接停止（更新 Cookie 后重新运行即可继续）
-            if result == 'login_expired':
-                print('由于登录失效，程序已停止。更新 Cookie 后重新运行即可继续抓取。')
-                break
+                batch_pages = list(range(page, min(page + CONCURRENCY, MAX_PAGE + 1)))
+                results = fetch_batch(batch_pages, cookie, executor)
 
-            if result != 'ok':
-                print(f'[跳过] 第 {page} 页已记录到 error_log.txt，继续下一页')
-                page += 1
-                time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
-                continue
+                # 主线程按页码顺序统一处理：统计 403、写 JSON、更新进度、写错误日志
+                for current_page in sorted(results):
+                    res = results[current_page]
 
-            items = find_items(data)
+                    # 403 连续计数只在主线程更新，避免多线程竞争
+                    status = res['status']
+                    if status == 403:
+                        consecutive_403 += 1
+                        if consecutive_403 >= 3:
+                            print('!!! 连续收到 403，Cookie 很可能已过期。')
+                            print('!!! 请重新复制 Cookie 覆盖 cookies.txt，然后重启脚本（已抓数据不会丢）。')
+                    elif status == 200:
+                        consecutive_403 = 0
 
-            # 情况 1：返回的数据里没找到商品列表（结构可能变了）
-            if items is None:
-                empty_streak += 1
-                record_error(page, '未在返回数据中找到商品列表')
-                if empty_streak >= 3:
-                    print('!!! 连续多页没找到商品列表，接口返回结构可能和预期不同。')
-                    print('!!! 请停止脚本，把任意一页的原始 JSON 发给我调整解析代码。')
-                page += 1
-                time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
-                continue
-            empty_streak = 0
+                    # 登录失效：不再处理本批剩余页，也不再创建新批次
+                    if res['result'] == 'login_expired':
+                        print('!!! 接口返回跳转/登录页，说明登录已失效（Cookie 过期）。')
+                        print('!!! 请重新复制 Cookie 覆盖 cookies.txt，然后重启脚本（已抓数据不会丢）。')
+                        record_error(current_page, res['error'])
+                        login_expired = True
+                        break
 
-            # 情况 2：商品列表为空，说明已经抓完了
-            if not items:
-                print('本页返回的商品列表为空，数据已全部抓完，正常结束。')
-                finished = True
-                break
+                    if res['result'] != 'ok':
+                        print(f'[跳过] 第 {current_page} 页已记录到 error_log.txt，继续下一页')
+                        record_error(current_page, res['error'])
+                        continue
 
-            rows = [extract_row(item, page) for item in items if isinstance(item, dict)]
-            save_page(rows)          # 立即写入 JSON 文件，不等全部抓完
-            save_progress(page)      # 记录进度，方便断点续传
-            total_saved += len(rows)
+                    # 超出总页数的页面：请求虽已发出，但数据不写入结果
+                    if total_pages and current_page > total_pages:
+                        continue
 
-            elapsed_min = (time.time() - start_time) / 60
-            print(f'[成功] 第 {page} 页 | 本页 {len(rows)} 条 | 累计 {total_saved} 条 | 用时 {elapsed_min:.1f} 分钟')
+                    data = res['data']
+                    items = find_items(data)
 
-            # 如果接口返回了总页数，达到后自动停止
-            total_pages = detect_total_pages(data)
-            if total_pages and page >= total_pages:
-                print(f'已达到接口返回的总页数（{total_pages} 页），抓取完成！')
-                finished = True
-                break
+                    # 情况 1：返回的数据里没找到商品列表（结构可能变了）
+                    if items is None:
+                        empty_streak += 1
+                        record_error(current_page, '未在返回数据中找到商品列表')
+                        if empty_streak >= 3:
+                            print('!!! 连续多页没找到商品列表，接口返回结构可能和预期不同。')
+                            print('!!! 请停止脚本，把任意一页的原始 JSON 发给我调整解析代码。')
+                        continue
+                    empty_streak = 0
 
-            page += 1
-            time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+                    # 情况 2：商品列表为空，说明已经抓完了（本批更高页码的数据不再写入）
+                    if not items:
+                        print(f'第 {current_page} 页返回的商品列表为空，数据已全部抓完，正常结束。')
+                        finished = True
+                        break
+
+                    rows = [extract_row(item, current_page) for item in items if isinstance(item, dict)]
+                    save_page(rows)              # 只有主线程会调用写文件函数
+                    save_progress(current_page)  # 记录进度，方便断点续传
+                    total_saved += len(rows)
+
+                    elapsed_min = (time.time() - start_time) / 60
+                    print(f'[保存成功] 第 {current_page} 页 | 本页 {len(rows)} 条'
+                          f' | 累计 {total_saved} 条 | 用时 {elapsed_min:.1f} 分钟')
+
+                    # 如果接口返回了总页数，达到后自动停止
+                    detected = detect_total_pages(data)
+                    if detected and total_pages is None:
+                        total_pages = detected
+                    if total_pages and current_page >= total_pages:
+                        print(f'已达到接口返回的总页数（{total_pages} 页），抓取完成！')
+                        finished = True
+                        break
+
+                if finished or login_expired:
+                    break
+
+                page = batch_pages[-1] + 1
+                if page <= MAX_PAGE:
+                    # 每批并发请求之间的随机暂停（不是每个 Worker 各自暂停）
+                    time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
 
     except KeyboardInterrupt:
-        print('\n已手动停止。进度已保存，重新运行脚本会从断点继续。')
+        print('\n已手动停止。已保存的数据仍在 JSON 文件中，重新运行脚本会从断点继续。')
 
-    if finished:
+    if login_expired:
+        print('由于登录失效，程序已停止。更新 Cookie 后重新运行即可继续抓取。')
+    elif finished:
         print(f'全部完成！本次共抓取 {total_saved} 条数据，保存在 {JSON_FILE}')
     else:
         print(f'本次运行结束（共保存 {total_saved} 条）。重新运行脚本可继续抓取。')
