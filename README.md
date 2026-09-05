@@ -8,6 +8,15 @@
 
 ## 版本日志
 
+### [v1.0.2](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.2)（2026-09-06）
+
+- 新增 `/ui/offer/images` 图片接口，通过 PNK 关联商品图片
+- 新增 `/commission/estimate` 佣金接口，通过 PNK 关联佣金百分比
+- 修正 `part_number_key` 的业务含义为 PNK码
+- 重构 JSON 输出为中文业务字段
+- 新增 `category_path` 最多五级类目拆分
+- 位于 `v1.0.2` 分支；main 分支代码仍为 v1.0.0
+
 ### [v1.0.1](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.1)（2026-09-05）
 
 - 输出文件改为时间戳命名：`YYYYMMDD_HHMMSS_PER_PAGE_MAX_PAGE.json`，历史结果不会被覆盖删除
