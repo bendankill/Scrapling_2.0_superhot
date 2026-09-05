@@ -4,9 +4,17 @@
 
 通过模拟浏览器请求 eMAG 后台 API 接口，循环翻页抓取海量商品数据（实测支持 21 万+ 条），支持多线程并发、断点续传、失败重试、登录失效检测，输出标准 JSON 文件。
 
-当前版本：**1.0.1**
+当前版本：**1.0.2**
 
 ## 版本日志
+
+### [v1.0.2](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.2)（2026-09-06）
+
+- 新增 `/ui/offer/images` 图片接口，通过 PNK 关联商品图片
+- 新增 `/commission/estimate` 佣金接口，通过 PNK 关联佣金百分比
+- 修正 `part_number_key` 的业务含义为 PNK码
+- 重构 JSON 输出为中文业务字段
+- 新增 `category_path` 最多五级类目拆分
 
 ### [v1.0.1](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.1)（2026-09-05）
 
@@ -27,6 +35,9 @@
 - 防封禁：每批并发请求之间随机暂停（`SLEEP_MIN`~`SLEEP_MAX` 秒）
 - 输出标准 JSON 数组文件（文件名带时间戳，可直接用 pandas 读取，历史结果不会被覆盖删除）
 - 安全输出文件命名：时间戳 JSON 采用原子文件占位，同一秒启动多个相同配置任务时不会争用、覆盖或删除同一个结果文件
+- 三接口联合抓取：主商品接口 + 图片接口 + 佣金接口，通过 PNK 自动关联
+- 支持最多五级类目拆分
+- 输出字段改为中文业务字段
 
 ## 环境要求
 
@@ -83,14 +94,36 @@ YYYYMMDD_HHMMSS_PER_PAGE_MAX_PAGE.json
 ```
 
 - 历史抓取结果不会被删除或覆盖，可放心反复运行。若相同配置任务在同一秒同时启动：程序会原子占用输出文件名；发生同秒冲突时，后启动的任务会等待到下一个可用秒级文件名，不会覆盖已有结果。
-- 文件内容为标准 JSON 数组：
+- 文件内容为标准 JSON 数组（全部为中文业务字段）：
 
 ```json
-[{"Title": "...", "Brand": "...", "Category": "...", "PNK": "", "PN": "...", "Image_URL": "", "_page": 1}]
+[{
+  "标题": "Chilot brazilian gri TF18, de dama, Uniconf, XL",
+  "品牌": "Uniconf",
+  "一级类": "Apparel Woman",
+  "二级类": "Women Lingerie & Pijamas",
+  "三级类": "Women Panties",
+  "四级类": "",
+  "五级类": "",
+  "产品类型": "",
+  "PNK码": "DQSQ7MBBM",
+  "最低价": "14.26",
+  "图片": "https://s13emagst.akamaized.net/.../image.jpg",
+  "颜色": "",
+  "评论数量": "2",
+  "商品评分": "5",
+  "完整类目": "Apparel Woman > Women Lingerie & Pijamas > Women Panties",
+  "是否属于高风险类目": "false",
+  "是否二手": "SGR包装",
+  "当前账号是否允许在该类目添加 Offer": "1",
+  "页数": "1",
+  "佣金": "23%",
+  "每页数量": "100"
+}]
 ```
 
-- 字段：`Title`（标题）、`Brand`（品牌）、`Category`（分类）、`PNK`、`PN`（零件号）、`Image_URL`（图片）、`_page`（来源页码）
-- `_page` 字段用于断点续传，不需要可以忽略
+- 字段：`标题`（product_name）、`品牌`（brand_name）、`一级类`~`五级类`（由 `category_path` 按 `>` 拆分，最多五级）、`产品类型`（属性 `Tip produs`，主接口未返回时为空）、`PNK码`（`part_number_key`）、`最低价`（best_price）、`图片`（images 接口按 PNK 关联）、`颜色`（属性 `Culoare`，主接口未返回时为空）、`评论数量`、`商品评分`、`完整类目`（原始 category_path）、`是否属于高风险类目`、`是否二手`、`当前账号是否允许在该类目添加 Offer`、`页数`、`佣金`（estimate 接口按 PNK 关联，百分比）、`每页数量`
+- `页数` 字段用于断点续传
 - 用 pandas 读取：`pd.read_json('20260905_214800_100_200.json')`
 
 ## 断点续传（RESUME = True）

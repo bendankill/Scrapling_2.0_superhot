@@ -4,7 +4,9 @@ eMAG 后台商品数据抓取脚本
 ==========================
 原理：模拟浏览器向 eMAG 后台接口循环发送 POST 请求，按"批次并发"抓取商品数据
       （每批 CONCURRENCY 页同时请求，主线程按页码顺序追加写入 JSON 文件），
-      中途断掉重新运行即可接着抓，已抓到的数据不会丢。
+      每页依次请求三个接口：opportunities（主商品）→ images（图片）→ estimate（佣金），
+      以 PNK码（part_number_key）关联，输出中文业务字段；中途断掉重新运行即可接着抓，
+      已抓到的数据不会丢。
 
 使用前准备：
 1. 安装依赖（需要 Python 3.10+）：
@@ -29,16 +31,19 @@ from scrapling.fetchers import Fetcher
 
 # ==================== 一、配置区（按需修改） ====================
 
-VERSION = '1.0.1'      # 程序版本号
+VERSION = '1.0.2'      # 程序版本号
 
-API_URL = 'https://marketplace.emag.ro/api-ui/opportunities/'
+# 三个接口（都用同一份登录态 Cookie，通过 PNK码/part_number_key 关联）
+API_URL = 'https://marketplace.emag.ro/api-ui/opportunities/'      # 主接口：商品数据 + 翻页入口
+IMAGES_API_URL = 'https://marketplace.emag.ro/ui/offer/images'         # 图片接口：按 PNK 批量取图片 URL
+ESTIMATE_API_URL = 'https://marketplace.emag.ro/commission/estimate'   # 佣金接口：按 PNK 批量取佣金百分比
 
 PER_PAGE = 100       # 每页条数。实测服务端接受 100 条/页：100 条时总页数 2134、全程约 2 小时；
                     # 25 条时总页数约 8535、全程约 8 小时。想抓得快就把这里改成 100
-MAX_PAGE = 200        # 翻页安全上限（当前是测试值：只抓 5 页验证效果）。
+MAX_PAGE = 2        # 翻页安全上限（当前是测试值：只抓 5 页验证效果）。
                     # 接口会返回总页数，脚本抓满会自动停止；测试没问题后改成 10000 再正式开跑
 RESUME = False       # 断点续传开关：True = 从上次进度继续抓；False = 清空旧数据、从第 1 页重新抓
-CONCURRENCY = 5     # 并发数量：同时请求的页面数（一批请求的页数）。1 = 单线程模式；
+CONCURRENCY = 1     # 并发数量：同时请求的页面数（一批请求的页数）。1 = 单线程模式；
                     # 5 = 每批同时抓 5 页；想调节抓取速度只改这个数字即可
 MAX_RETRIES = 2     # 每一页失败后的重试次数（登录失效不重试，会直接提示并停止）
 SLEEP_MIN = 1.5     # 每批并发请求之间的随机暂停最小秒数（V1.0.1 起按"批"暂停，不再是每页暂停）
@@ -74,20 +79,36 @@ REFERER_TEMPLATE = ('https://marketplace.emag.ro/opportunities/list'
                     '&sort=%7B%22field%22:%22performance%22,%22direction%22:%22asc%22%7D'
                     '&performance=1&page={page}')
 
-# 每条商品数据的字段（JSON 里就是这些键）
-FIELDS = ['Title', 'Brand', 'Category', 'PNK', 'PN', 'Image_URL']
-
-# 字段名对照表：左边是 JSON 里的字段名，右边是接口返回数据里的真实键名（按顺序挨个试）。
-# 已按真实返回数据核实：Title=product_name、Brand=brand_name、Category=category_name、PN=part_number
-# 注意：此接口不返回 PNK 和图片链接，这两项会留空（如需这两个数据，需要另抓商品详情接口）
-FIELD_MAP = {
-    'Title': ['product_name'],
-    'Brand': ['brand_name'],
-    'Category': ['category_name', 'category_path'],
-    'PNK': ['pnk', 'PNK', 'product_pnk'],
-    'PN': ['part_number', 'part_number_key'],
-    'Image_URL': ['image', 'image_url', 'main_image'],
+# 主接口字段候选键（内部映射用；按顺序挨个试，最终输出为中文业务字段）。
+# 已按真实返回数据核实：part_number_key 就是 PNK码；图片/佣金通过 PNK 从另两个接口关联
+MAIN_FIELD_KEYS = {
+    'title': ['product_name'],
+    'brand': ['brand_name'],
+    'pnk': ['part_number_key', 'partNumberKey'],
+    'best_price': ['best_price'],
+    'reviews': ['reviews'],
+    'rating': ['rating'],
+    'is_high_risk_category': ['is_high_risk_category'],
+    'recycle_warranty_label': ['recycle_warranty_label'],
+    'allowed_to_add_offer_in_category': ['allowed_to_add_offer_in_category'],
+    # estimate 佣金接口需要（真实接口核实：brandId 取 brand_doc_id，categoryId 取 category_scm_id）
+    'brand_id': ['brand_doc_id', 'brand_id', 'brandId'],
+    'category_id': ['category_scm_id', 'category_id', 'categoryId'],
+    'vendor_id': ['vendor_id', 'vendorId'],
 }
+
+# V1.0.2 最终输出字段（顺序固定，每条 JSON 记录只允许这些键，全部为中文）
+OUTPUT_FIELDS = [
+    '标题', '品牌', '一级类', '二级类', '三级类', '四级类', '五级类',
+    '产品类型', 'PNK码', '最低价', '图片', '颜色', '评论数量', '商品评分',
+    '完整类目', '是否属于高风险类目', '是否二手',
+    '当前账号是否允许在该类目添加 Offer', '页数', '佣金', '每页数量',
+]
+
+# 图片/佣金响应里的候选键（基于真实响应：images 用 pnk/imageURL；estimate 响应按复合键回显）
+IMAGE_PNK_KEYS = ['pnk', 'part_number_key', 'partNumberKey', 'PNK', 'product_pnk']
+IMAGE_URL_KEYS = ['imageURL', 'image_url', 'imageUrl', 'image', 'url', 'main_image']
+ESTIMATE_VALUE_KEYS = ['value', 'commission', 'commission_value', 'percentage']
 
 
 def sanitize_concurrency():
@@ -233,6 +254,8 @@ def get_value(item, keys):
                 if sub in value and isinstance(value[sub], str):
                     return value[sub]
             continue
+        if isinstance(value, bool):          # bool 是 int 子类，必须先于数字判断
+            return 'true' if value else 'false'
         if isinstance(value, str) and value.strip():
             return value.strip()
         if isinstance(value, (int, float)):
@@ -240,10 +263,167 @@ def get_value(item, keys):
     return ''
 
 
-def extract_row(item, page):
-    """把一条商品数据整理成一条 JSON 记录（_page 记录来自第几页，断点续传靠它）"""
-    row = {field: get_value(item, FIELD_MAP[field]) for field in FIELDS}
-    row['_page'] = page
+def get_raw(item, keys):
+    """按候选键名列表取原始值（保留数字/布尔类型，供 estimate 请求构造使用）"""
+    if not isinstance(item, dict):
+        return None
+    for key in keys:
+        if key in item and item[key] not in (None, ''):
+            return item[key]
+    return None
+
+
+def normalize_scalar(value):
+    """把任意标量统一为输出字符串：None→''、布尔→'true'/'false'、数字→去多余小数点的字符串"""
+    if value is None:
+        return ''
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    return ''
+
+
+def normalize_commission(value):
+    """把 estimate 返回的佣金值统一为百分比字符串：23/23.0/'23'/'23%'→'23%'，None→''
+    （真实接口返回 '23.00' 这样的百分比字符串，不是 0~1 小数，不乘不除）"""
+    if value is None or isinstance(value, bool):
+        return ''
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value.is_integer():
+            return f'{int(value)}%'
+        return f'{value}%'
+    if isinstance(value, str):
+        text = value.strip().rstrip('%').strip()
+        if not text:
+            return ''
+        try:
+            num = float(text)
+            return f'{int(num)}%' if num.is_integer() else f'{num}%'
+        except ValueError:
+            return f'{text}%'
+    return ''
+
+
+def get_category_path(item):
+    """取完整类目：字符串原样返回；列表则把各级 name 用 ' > ' 连接"""
+    raw = get_raw(item, ['category_path'])
+    if raw is None:
+        return ''
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, list):
+        parts = []
+        for part in raw:
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+            elif isinstance(part, dict):
+                for k in ('name', 'title', 'label', 'value'):
+                    if isinstance(part.get(k), str) and part[k].strip():
+                        parts.append(part[k].strip())
+                        break
+        return ' > '.join(parts)
+    return ''
+
+
+def split_category_path(path):
+    """把类目路径按 '>' 拆成最多五级，不足补空字符串"""
+    parts = [x.strip() for x in path.split('>') if x.strip()] if path else []
+    return (parts + [''] * 5)[:5]
+
+
+# 属性类字段（Tip produs / Culoare 等）可能所在的容器键，以及属性条目内部的名称/值键
+ATTR_CONTAINER_KEYS = ['attributes', 'features', 'characteristics', 'properties', 'specs']
+ATTR_NAME_KEYS = ['name', 'label', 'key', 'characteristic_name', 'attribute_name']
+ATTR_VALUE_KEYS = ['value', 'values', 'val', 'attribute_value']
+
+
+def extract_attribute(item, target):
+    """按属性名精确匹配取属性值（只在已知属性容器内查找，不做无边界递归）。
+    找不到返回 ''"""
+    if not isinstance(item, dict):
+        return ''
+    for container_key in ATTR_CONTAINER_KEYS:
+        container = item.get(container_key)
+        found = _attr_from_container(container, target)
+        if found:
+            return found
+    direct = item.get(target)
+    if direct not in (None, '', [], {}):
+        return direct
+    return ''
+
+
+def _attr_from_container(container, target):
+    if isinstance(container, dict):
+        name = _first_value(container, ATTR_NAME_KEYS)
+        if isinstance(name, str) and name.strip() == target:
+            value = _first_value(container, ATTR_VALUE_KEYS)
+            return value if value is not None else ''
+        if target in container and container[target] not in (None, '', [], {}):
+            return container[target]
+    elif isinstance(container, list):
+        for entry in container:
+            if isinstance(entry, dict):
+                name = _first_value(entry, ATTR_NAME_KEYS)
+                if isinstance(name, str) and name.strip() == target:
+                    value = _first_value(entry, ATTR_VALUE_KEYS)
+                    return value if value is not None else ''
+    return ''
+
+
+def _first_value(obj, keys):
+    """从字典里按候选键取第一个有效值（列表取首元素，对象取 url/src/link/value）"""
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        if key not in obj:
+            continue
+        value = obj[key]
+        if isinstance(value, list):
+            value = value[0] if value else ''
+        elif isinstance(value, dict):
+            value = _first_value(value, ['url', 'src', 'link', 'value'])
+        if value not in (None, '', [], {}):
+            return value
+    return None
+
+
+def extract_row(item, page, image_map=None, commission_map=None):
+    """把一条商品数据整理成一条 V1.0.2 中文 JSON 记录。
+    图片/佣金通过 PNK码 从 map 中关联（map 由本页批量接口请求构建）"""
+    image_map = image_map or {}
+    commission_map = commission_map or {}
+    pnk = get_value(item, MAIN_FIELD_KEYS['pnk'])
+    full_path = get_category_path(item)
+    cats = split_category_path(full_path)
+    row = {
+        '标题': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['title'])),
+        '品牌': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['brand'])),
+        '一级类': cats[0],
+        '二级类': cats[1],
+        '三级类': cats[2],
+        '四级类': cats[3],
+        '五级类': cats[4],
+        '产品类型': normalize_scalar(extract_attribute(item, 'Tip produs')),
+        'PNK码': pnk,
+        '最低价': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['best_price'])),
+        '图片': image_map.get(pnk, ''),
+        '颜色': normalize_scalar(extract_attribute(item, 'Culoare')),
+        '评论数量': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['reviews'])),
+        '商品评分': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['rating'])),
+        '完整类目': full_path,
+        '是否属于高风险类目': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['is_high_risk_category'])),
+        '是否二手': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['recycle_warranty_label'])),
+        '当前账号是否允许在该类目添加 Offer': normalize_scalar(get_value(item, MAIN_FIELD_KEYS['allowed_to_add_offer_in_category'])),
+        '页数': str(page),
+        '佣金': normalize_commission(commission_map.get(pnk)) if pnk else '',
+        '每页数量': str(PER_PAGE),
+    }
     return row
 
 
@@ -378,7 +558,10 @@ def _last_page_from_json():
         idx = tail.rfind('{')              # 最后一条记录的开头
         if idx < 0:
             return None
-        return int(json.loads(tail[idx:]).get('_page', 0)) + 1
+        row = json.loads(tail[idx:])
+        # V1.0.2 输出用"页数"字段；兼容旧版 "_page"
+        page_value = row.get('页数', row.get('_page', 0))
+        return int(page_value) + 1
     except Exception:
         return None
 
@@ -409,20 +592,19 @@ def looks_like_login_page(resp):
         return False
 
 
-def fetch_page(page, cookie):
-    """请求某一页（在工作线程里执行，不写任何共享状态、不写任何文件）。
+def post_api(url, headers, payload, page, label='接口'):
+    """通用 POST（工作线程内执行）：重试、跳转/登录页检测、最终 403 标记。
     返回 dict：
       result: 'ok'=成功 / 'login_expired'=登录失效 / 'failed'=失败
-      data:   解析后的响应 JSON（仅 result='ok' 时有值）
-      error:  失败原因描述（由主线程统一写入 error_log.txt）
-      status: 最后一次响应的状态码（由主线程统一统计 403 次数）"""
+      data / error / status: 解析结果、错误描述、最后一次状态码
+      had_403: 最终（重试后）是否仍为 403"""
     last_status = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = Fetcher.post(
-                API_URL,
-                headers=make_headers(page, cookie),
-                json=make_payload(page),
+                url,
+                headers=headers,
+                json=payload,
                 timeout=30,
                 impersonate='chrome',       # 模拟 Chrome 浏览器的 TLS 指纹，防止被服务器拦截
                 follow_redirects=False,     # 不自动跟随跳转：正常接口不会跳转，一旦跳转说明登录失效
@@ -433,30 +615,190 @@ def fetch_page(page, cookie):
             # 接口跳转（302 等）= 登录失效，重试也没用，直接报告
             if status in (301, 302, 303, 307, 308):
                 return {'result': 'login_expired', 'data': None,
-                        'error': '登录失效（接口跳转到登录页）', 'status': status}
+                        'error': f'{label}登录失效（接口跳转到登录页）', 'status': status,
+                        'had_403': False}
 
             if status == 200:
                 try:
                     return {'result': 'ok', 'data': safe_json(resp),
-                            'error': None, 'status': status}
+                            'error': None, 'status': status, 'had_403': False}
                 except Exception:
                     # 状态码 200 但解析不出 JSON：再确认是不是返回了登录页
                     if looks_like_login_page(resp):
                         return {'result': 'login_expired', 'data': None,
-                                'error': '登录失效（返回登录页）', 'status': status}
+                                'error': f'{label}登录失效（返回登录页）', 'status': status,
+                                'had_403': False}
 
             if attempt < MAX_RETRIES:
-                print(f'[重试] 第 {page} 页返回状态码 {status}，第 {attempt}/{MAX_RETRIES} 次重试...')
+                print(f'[重试] 第 {page} 页{label}返回状态码 {status}，第 {attempt}/{MAX_RETRIES} 次重试...')
                 time.sleep(random.uniform(3, 6))
         except Exception as exc:
             if attempt < MAX_RETRIES:
-                print(f'[重试] 第 {page} 页网络异常：{exc}，第 {attempt}/{MAX_RETRIES} 次重试...')
+                print(f'[重试] 第 {page} 页{label}网络异常：{exc}，第 {attempt}/{MAX_RETRIES} 次重试...')
                 time.sleep(random.uniform(3, 6))
             else:
                 return {'result': 'failed', 'data': None,
-                        'error': f'异常：{exc}', 'status': last_status}
+                        'error': f'{label}异常：{exc}', 'status': last_status,
+                        'had_403': last_status == 403}
     return {'result': 'failed', 'data': None,
-            'error': f'状态码 {last_status}，重试 {MAX_RETRIES} 次仍失败', 'status': last_status}
+            'error': f'{label}状态码 {last_status}，重试 {MAX_RETRIES} 次仍失败',
+            'status': last_status, 'had_403': last_status == 403}
+
+
+def make_api_headers(cookie, referer):
+    """构造辅助接口（images/estimate）请求头：复用基础头 + 固定 referer + Cookie"""
+    headers = dict(HEADERS)
+    headers['referer'] = referer
+    headers['cookie'] = cookie
+    return headers
+
+
+def build_images_payload(pnks):
+    """构造 images 批量请求体（products = 本页全部有效 PNK，resolution 固定 150x150）"""
+    return {'products': list(pnks), 'resolution': '150x150'}
+
+
+def build_estimate_item(item):
+    """从主接口商品数据构造 estimate 请求项；缺必填字段返回 None（跳过该商品）。
+    真实接口核实：brandId 取 brand_doc_id、categoryId 取 category_scm_id、
+    price 取 best_price；vendorId 主接口不提供，服务器按登录态自动识别，无需发送"""
+    pnk = get_value(item, MAIN_FIELD_KEYS['pnk'])
+    brand_id = get_raw(item, MAIN_FIELD_KEYS['brand_id'])
+    category_id = get_raw(item, MAIN_FIELD_KEYS['category_id'])
+    price = get_raw(item, MAIN_FIELD_KEYS['best_price'])
+    if not pnk or category_id is None or price is None:
+        return None
+    entry = {
+        'partNumberKey': pnk,
+        'brandId': brand_id,
+        'categoryId': category_id,
+        'price': price,
+    }
+    return entry
+
+
+def build_estimate_payload(estimate_items):
+    """构造 estimate 批量请求体。注意：products 的值是 JSON 序列化后的字符串，
+    不是普通数组（已按真实接口格式核实）"""
+    return {'products': json.dumps(estimate_items, ensure_ascii=False)}
+
+
+def parse_image_map(data):
+    """解析 images 响应，构建 {PNK: 图片URL}。真实响应结构：
+    {'isError': ..., 'messages': ..., 'results': [{'pnk': ..., 'imageURL': ...}]}
+    每个 PNK 只取第一条有效 URL"""
+    image_map = {}
+    entries = []
+    if isinstance(data, dict):
+        for key in ('results', 'products', 'items', 'data', 'images'):
+            if isinstance(data.get(key), list):
+                entries = data[key]
+                break
+        if not entries:
+            entries = list(data.values())
+    elif isinstance(data, list):
+        entries = data
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        pnk = _first_value(entry, IMAGE_PNK_KEYS)
+        url = _first_value(entry, IMAGE_URL_KEYS)
+        if isinstance(pnk, str) and pnk and isinstance(url, str) and url:
+            image_map.setdefault(pnk, url)   # 同 PNK 多条时保留第一条
+    return image_map
+
+
+def parse_commission_map(data):
+    """解析 estimate 响应，构建 {PNK: 原始value}（value 在写 JSON 时再格式化为百分比）。
+    真实响应结构：{'242169,DQSQ7MBBM,32773,2280': {'value': '23.00', ...}}
+    键格式为 {vendorId},{pnk},{brandId},{categoryId}，逗号拆分后第 2 段是 PNK"""
+    commission_map = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            parts = key.split(',')
+            pnk = parts[1] if len(parts) > 1 else key
+            if pnk:
+                commission_map[pnk] = _first_value(value, ESTIMATE_VALUE_KEYS)
+    return commission_map
+
+
+def fetch_page(page, cookie):
+    """请求某一页（在工作线程里执行，不写任何共享状态、不写任何文件）。
+    流程：主接口 → images 批量接口 → estimate 批量接口（顺序执行，每页约 3 个请求）。
+    返回 dict：
+      result: 'ok'=成功 / 'login_expired'=登录失效 / 'failed'=失败
+      data:   主接口响应 JSON（仅 result='ok' 时有值）
+      error:  失败原因描述（由主线程统一写入 error_log.txt）
+      status: 主接口最后一次响应的状态码
+      had_403: 本页三个请求中是否有任一请求最终仍为 403（页面级 final 403 标记）
+      image_map / commission_map: {PNK: 值} 关联表
+      errors: [(页码, 描述)] 辅助接口失败/字段缺失记录（由主线程统一写 error_log）"""
+    errors = []
+    result = post_api(API_URL, make_headers(page, cookie), make_payload(page), page, label='主接口')
+    if result['result'] == 'login_expired':
+        return {'result': 'login_expired', 'data': None, 'error': result['error'],
+                'status': result['status'], 'had_403': result['had_403'],
+                'image_map': {}, 'commission_map': {}, 'errors': []}
+    if result['result'] != 'ok':
+        return {'result': 'failed', 'data': None, 'error': result['error'],
+                'status': result['status'], 'had_403': result['had_403'],
+                'image_map': {}, 'commission_map': {}, 'errors': []}
+    data = result['data']
+    had_403 = result['had_403']
+
+    image_map = {}
+    commission_map = {}
+    items = find_items(data)
+    if items is not None:
+        pnks = []
+        estimate_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            pnk = get_value(item, MAIN_FIELD_KEYS['pnk'])
+            if not pnk:
+                errors.append((page, '商品缺少 part_number_key（PNK码），图片/佣金将留空'))
+                continue
+            pnks.append(pnk)
+            estimate_entry = build_estimate_item(item)
+            if estimate_entry is None:
+                errors.append((page, f'PNK {pnk} 缺少 estimate 必填字段（PNK码/类目ID/价格），跳过佣金查询'))
+            else:
+                estimate_items.append(estimate_entry)
+
+        # images：补充接口。失败只留空图片，不丢整页商品
+        if pnks:
+            aux = post_api(IMAGES_API_URL, make_api_headers(cookie, 'https://marketplace.emag.ro/opportunities/list'),
+                           build_images_payload(pnks), page, label='图片接口')
+            had_403 = had_403 or aux['had_403']
+            if aux['result'] == 'ok':
+                image_map = parse_image_map(aux['data'])
+            elif aux['result'] == 'login_expired':
+                return {'result': 'login_expired', 'data': data, 'error': aux['error'],
+                        'status': aux['status'], 'had_403': had_403,
+                        'image_map': {}, 'commission_map': {}, 'errors': errors}
+            else:
+                errors.append((page, f'图片接口失败：{aux["error"]}（本页商品图片留空）'))
+
+        # estimate：补充接口。失败只留空佣金，不丢整页商品
+        if estimate_items:
+            aux = post_api(ESTIMATE_API_URL, make_api_headers(cookie, 'https://marketplace.emag.ro/opportunities/list'),
+                           build_estimate_payload(estimate_items), page, label='佣金接口')
+            had_403 = had_403 or aux['had_403']
+            if aux['result'] == 'ok':
+                commission_map = parse_commission_map(aux['data'])
+            elif aux['result'] == 'login_expired':
+                return {'result': 'login_expired', 'data': data, 'error': aux['error'],
+                        'status': aux['status'], 'had_403': had_403,
+                        'image_map': {}, 'commission_map': {}, 'errors': errors}
+            else:
+                errors.append((page, f'佣金接口失败：{aux["error"]}（本页商品佣金留空）'))
+
+    return {'result': 'ok', 'data': data, 'error': None, 'status': result['status'],
+            'had_403': had_403, 'image_map': image_map,
+            'commission_map': commission_map, 'errors': errors}
 
 
 def fetch_batch(pages, cookie, executor):
@@ -540,9 +882,10 @@ def main():
                     res = results[current_page]
 
                     # 403 连续计数只在主线程更新，避免多线程竞争。
-                    # 按最终请求结果统计：某页重试后最终仍为 403 才记一次，收到 200 清零
-                    status = res['status']
-                    if status == 403:
+                    # 页面级 final 403：本页三个接口（主/图片/佣金）中任一请求重试后最终仍为 403，
+                    # 本页就记一次；本页全部请求都没有最终 403 则清零。统计单位是"页"，
+                    # 同一页内 images 403 + estimate 403 不会算成两次
+                    if res.get('had_403'):
                         consecutive_403 += 1
                         if consecutive_403 >= 3:
                             print('!!! 连续多个页面最终返回 403，Cookie 或 WAF Token 很可能已失效。')
@@ -551,7 +894,7 @@ def main():
                             record_error(current_page, '连续多个页面最终返回 403，程序已停止')
                             blocked_403 = True
                             break
-                    elif status == 200:
+                    else:
                         consecutive_403 = 0
 
                     # 登录失效：不再处理本批剩余页，也不再创建新批次
@@ -570,6 +913,10 @@ def main():
                     # 超出总页数的页面：请求虽已发出，但数据不写入结果
                     if total_pages and current_page > total_pages:
                         continue
+
+                    # 辅助接口失败/字段缺失记录（工作线程只收集，主线程统一写日志）
+                    for err_page, err_msg in res.get('errors', []):
+                        record_error(err_page, err_msg)
 
                     data = res['data']
                     items = find_items(data)
@@ -590,7 +937,8 @@ def main():
                         finished = True
                         break
 
-                    rows = [extract_row(item, current_page) for item in items if isinstance(item, dict)]
+                    rows = [extract_row(item, current_page, res.get('image_map', {}), res.get('commission_map', {}))
+                            for item in items if isinstance(item, dict)]
                     save_page(rows)              # 只有主线程会调用写文件函数
                     save_progress(current_page)  # 记录进度，方便断点续传
                     total_saved += len(rows)
