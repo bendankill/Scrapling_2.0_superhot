@@ -6,6 +6,22 @@
 
 当前版本：**1.0.0**
 
+## 版本日志
+
+### [v1.0.1](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.1)（2026-09-05）
+
+- 输出文件改为时间戳命名：`YYYYMMDD_HHMMSS_PER_PAGE_MAX_PAGE.json`，历史结果不会被覆盖删除
+- 新增 `CONCURRENCY` 多线程批次并发抓取（`1` = 单线程），主线程按页码顺序统一写入，JSON 线程安全
+- 暂停改为并发批次之间的随机暂停（`SLEEP_MIN`~`SLEEP_MAX`）
+- `RESUME=True` 自动匹配最近一次同配置（`PER_PAGE`+`MAX_PAGE`）的抓取文件断点续传
+- 位于 `v1.0.1` 分支 / `v1.0.1` tag；main 分支仍为 v1.0.0
+
+### [v1.0.0](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.0)（2026-09-05）
+
+- 首个版本：Scrapling `Fetcher` + `impersonate='chrome'` 模拟浏览器 TLS 指纹，绕过 WAF 拦截
+- 循环翻页（接口总页数自动检测 + `MAX_PAGE` 兜底）、断点续传、失败重试、登录失效检测
+- 每页随机暂停防封禁，输出 `emag_products.json` 标准 JSON 数组
+
 ## 功能特性
 
 - 基于 Scrapling `Fetcher`（curl_cffi 引擎）+ `impersonate='chrome'` 模拟浏览器 TLS 指纹，绕过 WAF 拦截
