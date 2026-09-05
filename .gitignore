@@ -5,6 +5,9 @@ emag_products.csv
 progress.txt
 error_log.txt
 
+# V1.0.1+ 时间戳抓取结果（例：20260905_214800_100_200.json）
+20??????_??????_*_*.json
+
 # Python 缓存
 __pycache__/
 *.pyc

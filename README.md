@@ -6,6 +6,16 @@
 
 当前版本：**1.0.1**
 
+## 版本日志
+
+### [v1.0.1](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.1)（2026-09-05）
+
+- JSON 输出文件使用 `YYYYMMDD_HHMMSS_PER_PAGE_MAX_PAGE.json` 命名
+- 支持可配置多线程批次并发抓取（`CONCURRENCY`，`1` = 单线程）
+- 修复连续 403 后仍继续创建请求批次的问题
+- 增强 JSON 写入异常/中断时的回滚保护
+- 修复同一秒启动多个相同配置任务时可能争用同一个输出文件的问题，采用原子文件占位避免覆盖和数据竞争
+
 ## 功能特性
 
 - 基于 Scrapling `Fetcher`（curl_cffi 引擎）+ `impersonate='chrome'` 模拟浏览器 TLS 指纹，绕过 WAF 拦截
@@ -16,17 +26,18 @@
 - 登录失效检测：Cookie 过期时自动识别（302 跳转/登录页响应/连续 403），明确提示并停止
 - 防封禁：每批并发请求之间随机暂停（`SLEEP_MIN`~`SLEEP_MAX` 秒）
 - 输出标准 JSON 数组文件（文件名带时间戳，可直接用 pandas 读取，历史结果不会被覆盖删除）
+- 安全输出文件命名：时间戳 JSON 采用原子文件占位，同一秒启动多个相同配置任务时不会争用、覆盖或删除同一个结果文件
 
 ## 环境要求
 
-- Python 3.9+
-- Scrapling 0.4.13+（`pip install -U scrapling`）
+- Python 3.10+
+- Scrapling 0.4.13+（`python -m pip install -U "scrapling[fetchers]"`）
 
 ## 快速开始
 
 ```bash
 # 1. 安装依赖
-pip install -U scrapling
+python -m pip install -U "scrapling[fetchers]"
 
 # 2. 配置 Cookie（见下文），保存到项目目录 cookies.txt
 
@@ -71,7 +82,7 @@ YYYYMMDD_HHMMSS_PER_PAGE_MAX_PAGE.json
 20260905_214800_100_200.json
 ```
 
-- 历史抓取结果不会被删除或覆盖，可放心反复运行
+- 历史抓取结果不会被删除或覆盖，可放心反复运行。若相同配置任务在同一秒同时启动：程序会原子占用输出文件名；发生同秒冲突时，后启动的任务会等待到下一个可用秒级文件名，不会覆盖已有结果。
 - 文件内容为标准 JSON 数组：
 
 ```json
@@ -96,7 +107,7 @@ YYYYMMDD_HHMMSS_PER_PAGE_MAX_PAGE.json
 
 **提示"登录已失效（Cookie 过期）"**：按上文步骤重新复制 Cookie 覆盖 cookies.txt，重启脚本即可，已抓数据不丢。
 
-**连续收到 403**：Cookie 或 `aws-waf-token` 过期，同上处理。
+**连续收到 403**：连续 3 个页面最终返回 403 时程序会自动停止（不再创建新的请求批次），Cookie 或 `aws-waf-token` 可能已失效，更新 cookies.txt 后重新运行即可（已抓数据不丢）。
 
 **想从头重新抓**：把 `RESUME` 改成 `False`，运行时会新建一个时间戳文件从头抓；历史时间戳 JSON 文件不会被删除。
 

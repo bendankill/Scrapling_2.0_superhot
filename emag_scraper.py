@@ -7,7 +7,9 @@ eMAG 后台商品数据抓取脚本
       中途断掉重新运行即可接着抓，已抓到的数据不会丢。
 
 使用前准备：
-1. 安装依赖：  pip install -U scrapling   （需要 0.4.13 以上版本，否则请求 API 不同会报错）
+1. 安装依赖（需要 Python 3.10+）：
+   python -m pip install -U "scrapling[fetchers]"
+   （需要 0.4.13 以上版本，否则请求 API 不同会报错）
 2. 把浏览器里复制的完整 Cookie 保存到同目录下的 cookies.txt 文件中（一行）
    Cookie 会过期（一般几小时到 1 天），过期后重新复制并覆盖 cookies.txt 即可
 3. 运行：      python emag_scraper.py
@@ -249,9 +251,35 @@ def extract_row(item, page):
 
 def build_json_filename():
     """生成本次运行的输出文件名：{YYYYMMDD_HHMMSS}_{PER_PAGE}_{MAX_PAGE}.json
-    只在任务开始时调用一次，整个任务期间保持不变（不会每保存一页重新生成）"""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    return f'{timestamp}_{PER_PAGE}_{MAX_PAGE}.json'
+    只在任务开始时调用一次，整个任务期间保持不变（不会每保存一页重新生成）。
+    用 O_CREAT | O_EXCL 原子占位：同一秒多个任务竞争同一文件名时只有一个成功，
+    失败的等到下一秒再试，绝不覆盖或删除已有文件"""
+    while True:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'{timestamp}_{PER_PAGE}_{MAX_PAGE}.json'
+        try:
+            # 检查 + 创建作为一个原子操作完成，杜绝"先检查后使用"的竞争窗口
+            fd = os.open(filename, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            print(f'[提示] 输出文件 {filename} 已被占用，等待下一秒生成新文件名（不会覆盖已有文件）...')
+            time.sleep(1.1)   # 略超 1 秒，确保醒来时已进入下一秒
+            continue
+        # 占位成功：立即初始化为合法 JSON []，并强制落盘
+        failed = False
+        try:
+            os.write(fd, b'[]')
+            os.fsync(fd)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            os.close(fd)
+            if failed:
+                try:
+                    os.remove(filename)   # 初始化失败不留下坏的占位文件（先关句柄，Windows 才能删）
+                except OSError:
+                    pass
+        return filename
 
 
 def find_latest_json():
@@ -265,32 +293,45 @@ def find_latest_json():
 
 
 def save_page(rows):
-    """把一页的数据立即追加写入 JSON 文件（标准 JSON 数组格式，不会内存溢出）"""
-    # 判断文件是否已有数据（不存在、或只有 "[" 开头，都按新文件处理）
-    file_has_data = os.path.exists(JSON_FILE) and os.path.getsize(JSON_FILE) > 2
-    if not file_has_data:
-        # 新文件：先写开头的 [，再追加记录，最后补 ]
-        with open(JSON_FILE, 'w', encoding='utf-8') as f:
-            f.write('[')
-        with open(JSON_FILE, 'a', encoding='utf-8') as f:
-            for i, row in enumerate(rows):
-                if i > 0:
-                    f.write(',')   # 记录之间用逗号分隔（第一条除外）
-                f.write(json.dumps(row, ensure_ascii=False))
-            f.write(']')
-            f.flush()
-            os.fsync(f.fileno())   # 强制写盘，防止意外断电丢数据
-    else:
-        # 已有数据：回退一个字符覆盖掉结尾的 ]，追加新记录后再补 ]
+    """把一页的数据立即追加写入 JSON 文件（标准 JSON 数组格式，不会内存溢出）。
+    原地追加；写入过程中发生异常（含 Ctrl+C）时，把文件回滚到写入前的合法状态，
+    再把原异常继续向外抛出（绝不吞掉 KeyboardInterrupt）"""
+    size_before = os.path.getsize(JSON_FILE) if os.path.exists(JSON_FILE) else 0
+    rollback_size = None      # 写入前的文件大小；None 表示写入还没开始，无需回滚
+    try:
+        if size_before <= 2:
+            # 新文件/空文件：先建立合法的基础状态 []，再往里追加
+            with open(JSON_FILE, 'w', encoding='utf-8') as f:
+                f.write('[]')
+                f.flush()
+                os.fsync(f.fileno())
+            rollback_size = 2
+        else:
+            rollback_size = size_before
+
         with open(JSON_FILE, 'r+', encoding='utf-8') as f:
-            f.seek(0, 2)           # 移到文件末尾
-            f.seek(f.tell() - 1)   # 回退一个字符
-            for row in rows:
-                f.write(',')
+            f.seek(rollback_size - 1)   # 覆盖掉结尾的 ]
+            for i, row in enumerate(rows):
+                # 已有数据时第一条也要逗号（覆盖掉了 ]）；空文件的第一条不加逗号
+                if i > 0 or rollback_size > 2:
+                    f.write(',')
                 f.write(json.dumps(row, ensure_ascii=False))
-            f.write(']')
+            f.write(']')                # 补回结尾的 ]
             f.flush()
-            os.fsync(f.fileno())
+            os.fsync(f.fileno())        # 强制写盘，防止意外断电丢数据
+    except BaseException:
+        # 局部回滚：截断回写入前的大小，补回结尾的 ]，恢复合法 JSON 后重新抛出原异常
+        try:
+            if rollback_size is not None and os.path.exists(JSON_FILE):
+                with open(JSON_FILE, 'r+', encoding='utf-8') as f:
+                    f.truncate(rollback_size)
+                    f.seek(rollback_size - 1)
+                    f.write(']')
+                    f.flush()
+                    os.fsync(f.fileno())
+        except Exception:
+            pass   # 回滚本身失败不掩盖原异常
+        raise
 
 
 def save_progress(page):
@@ -301,8 +342,10 @@ def save_progress(page):
 
 def reset_data_files():
     """从头开始抓（RESUME = False）时清理本次运行的状态文件。
-    注意：只清理进度文件和错误日志；历史 JSON 文件名带时间戳，一律不删除"""
-    for file in (JSON_FILE, PROGRESS_FILE, ERROR_LOG):
+    注意：只清理进度文件和错误日志；JSON_FILE 是刚原子占位成功的新文件，
+    绝不能删除（删掉后另一个进程又能取得同一个名字，原子保护就失效了）；
+    历史 JSON 文件名带时间戳，也一律不删除"""
+    for file in (PROGRESS_FILE, ERROR_LOG):
         if os.path.exists(file):
             os.remove(file)
 
@@ -478,6 +521,7 @@ def main():
     start_time = time.time()
     finished = False
     login_expired = False
+    blocked_403 = False     # 连续多个页面最终返回 403，达到阈值后停止
 
     try:
         with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
@@ -495,13 +539,18 @@ def main():
                 for current_page in sorted(results):
                     res = results[current_page]
 
-                    # 403 连续计数只在主线程更新，避免多线程竞争
+                    # 403 连续计数只在主线程更新，避免多线程竞争。
+                    # 按最终请求结果统计：某页重试后最终仍为 403 才记一次，收到 200 清零
                     status = res['status']
                     if status == 403:
                         consecutive_403 += 1
                         if consecutive_403 >= 3:
-                            print('!!! 连续收到 403，Cookie 很可能已过期。')
-                            print('!!! 请重新复制 Cookie 覆盖 cookies.txt，然后重启脚本（已抓数据不会丢）。')
+                            print('!!! 连续多个页面最终返回 403，Cookie 或 WAF Token 很可能已失效。')
+                            print('!!! 程序将停止，不再创建新的请求批次。')
+                            print('!!! 请更新 cookies.txt 后重新运行。')
+                            record_error(current_page, '连续多个页面最终返回 403，程序已停止')
+                            blocked_403 = True
+                            break
                     elif status == 200:
                         consecutive_403 = 0
 
@@ -559,7 +608,7 @@ def main():
                         finished = True
                         break
 
-                if finished or login_expired:
+                if finished or login_expired or blocked_403:
                     break
 
                 page = batch_pages[-1] + 1
@@ -570,7 +619,11 @@ def main():
     except KeyboardInterrupt:
         print('\n已手动停止。已保存的数据仍在 JSON 文件中，重新运行脚本会从断点继续。')
 
-    if login_expired:
+    if blocked_403:
+        print('由于连续收到 403，程序已停止。')
+        print('Cookie 或 aws-waf-token 可能已经失效。')
+        print('请更新 cookies.txt 后重新运行。')
+    elif login_expired:
         print('由于登录失效，程序已停止。更新 Cookie 后重新运行即可继续抓取。')
     elif finished:
         print(f'全部完成！本次共抓取 {total_saved} 条数据，保存在 {JSON_FILE}')
