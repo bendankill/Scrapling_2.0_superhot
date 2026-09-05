@@ -1,0 +1,13 @@
+# 敏感文件与运行产物（不提交到 GitHub）
+cookies.txt
+emag_products.json
+emag_products.csv
+progress.txt
+error_log.txt
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Claude Code 工作目录
+.claude/
