@@ -8,6 +8,14 @@
 
 ## 版本日志
 
+### [v1.0.3](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.3)（2026-09-06）
+
+- 新增 CSV 输出，每次抓取同步生成 JSON 与 CSV 两种格式
+- JSON / CSV 使用相同时间戳基名和相同 21 个中文业务字段
+- CSV 使用 Excel 友好的 UTF-8 BOM 编码
+- CSV 按页增量写入，并与 JSON 保持页级一致
+- 位于 `v1.0.3` 分支；main 分支代码仍为 v1.0.0
+
 ### [v1.0.2](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.2)（2026-09-06）
 
 - 新增 `/ui/offer/images` 图片接口，通过 PNK 关联商品图片
