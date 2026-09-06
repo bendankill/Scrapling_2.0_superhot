@@ -5,8 +5,8 @@ eMAG 后台商品数据抓取脚本
 原理：模拟浏览器向 eMAG 后台接口循环发送 POST 请求，按"批次并发"抓取商品数据
       （每批 CONCURRENCY 页同时请求，主线程按页码顺序追加写入 JSON 文件），
       每页依次请求三个接口：opportunities（主商品）→ images（图片）→ estimate（佣金），
-      以 PNK码（part_number_key）关联，输出中文业务字段；中途断掉重新运行即可接着抓，
-      已抓到的数据不会丢。
+      以 PNK码（part_number_key）关联，输出中文业务字段，同时生成 JSON 与 CSV 两份结果文件；
+      中途断掉重新运行即可接着抓，已抓到的数据不会丢。
 
 使用前准备：
 1. 安装依赖（需要 Python 3.10+）：
@@ -17,7 +17,9 @@ eMAG 后台商品数据抓取脚本
 3. 运行：      python emag_scraper.py
 """
 
+import csv
 import glob
+import io
 import json
 import math
 import os
@@ -31,7 +33,7 @@ from scrapling.fetchers import Fetcher
 
 # ==================== 一、配置区（按需修改） ====================
 
-VERSION = '1.0.2'      # 程序版本号
+VERSION = '1.0.3'      # 程序版本号
 
 # 三个接口（都用同一份登录态 Cookie，通过 PNK码/part_number_key 关联）
 API_URL = 'https://marketplace.emag.ro/api-ui/opportunities/'      # 主接口：商品数据 + 翻页入口
@@ -40,7 +42,7 @@ ESTIMATE_API_URL = 'https://marketplace.emag.ro/commission/estimate'   # 佣金�
 
 PER_PAGE = 100       # 每页条数。实测服务端接受 100 条/页：100 条时总页数 2134、全程约 2 小时；
                     # 25 条时总页数约 8535、全程约 8 小时。想抓得快就把这里改成 100
-MAX_PAGE = 2        # 翻页安全上限（当前是测试值：只抓 5 页验证效果）。
+MAX_PAGE = 2150        # 翻页安全上限（当前是测试值：只抓 5 页验证效果）。
                     # 接口会返回总页数，脚本抓满会自动停止；测试没问题后改成 10000 再正式开跑
 RESUME = False       # 断点续传开关：True = 从上次进度继续抓；False = 清空旧数据、从第 1 页重新抓
 CONCURRENCY = 1     # 并发数量：同时请求的页面数（一批请求的页数）。1 = 单线程模式；
@@ -49,7 +51,8 @@ MAX_RETRIES = 2     # 每一页失败后的重试次数（登录失效不重试�
 SLEEP_MIN = 1.5     # 每批并发请求之间的随机暂停最小秒数（V1.0.1 起按"批"暂停，不再是每页暂停）
 SLEEP_MAX = 3.5     # 每批并发请求之间的随机暂停最大秒数
 
-JSON_FILE = ''      # 输出文件名：程序启动时按 {YYYYMMDD_HHMMSS}_{PER_PAGE}_{MAX_PAGE}.json 动态生成
+JSON_FILE = ''      # JSON 输出文件名：程序启动时按 {YYYYMMDD_HHMMSS}_{PER_PAGE}_{MAX_PAGE}.json 动态生成
+CSV_FILE = ''       # CSV 输出文件名：与 JSON_FILE 同基名的 .csv（两个文件成对生成，时间戳一致）
 PROGRESS_FILE = 'progress.txt'      # 断点续传进度文件（记录已抓完的页码）
 ERROR_LOG = 'error_log.txt'         # 失败页码的日志文件
 COOKIE_FILE = 'cookies.txt'         # 存放 Cookie 的文件（Cookie 过期后替换里面内容即可）
@@ -429,37 +432,63 @@ def extract_row(item, page, image_map=None, commission_map=None):
 
 # ==================== 五、保存与断点续传 ====================
 
-def build_json_filename():
-    """生成本次运行的输出文件名：{YYYYMMDD_HHMMSS}_{PER_PAGE}_{MAX_PAGE}.json
-    只在任务开始时调用一次，整个任务期间保持不变（不会每保存一页重新生成）。
-    用 O_CREAT | O_EXCL 原子占位：同一秒多个任务竞争同一文件名时只有一个成功，
-    失败的等到下一秒再试，绝不覆盖或删除已有文件"""
+def build_output_files():
+    """生成本次任务的一对输出文件（JSON + CSV），基名（时间戳）只生成一次，
+    任务期间保持不变。用 O_CREAT | O_EXCL 原子占位：先占 JSON 再占 CSV，两者都成功才算成功；
+    任一文件已被占用（同秒竞争/历史文件）时，安全删除本次刚创建、尚未写业务数据的占位文件，
+    等待进入下一秒后重新同时尝试两个文件。绝不覆盖或删除已有文件"""
     while True:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f'{timestamp}_{PER_PAGE}_{MAX_PAGE}.json'
+        basename = f'{timestamp}_{PER_PAGE}_{MAX_PAGE}'
+        json_name = f'{basename}.json'
+        csv_name = f'{basename}.csv'
         try:
-            # 检查 + 创建作为一个原子操作完成，杜绝"先检查后使用"的竞争窗口
-            fd = os.open(filename, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd_json = os.open(json_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            print(f'[提示] 输出文件 {filename} 已被占用，等待下一秒生成新文件名（不会覆盖已有文件）...')
+            print(f'[提示] 输出文件 {json_name} 已被占用，等待下一秒重新生成文件对（不会覆盖已有文件）...')
             time.sleep(1.1)   # 略超 1 秒，确保醒来时已进入下一秒
             continue
-        # 占位成功：立即初始化为合法 JSON []，并强制落盘
+        try:
+            fd_csv = os.open(csv_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # 本次 JSON 占位尚无业务数据，安全删除后等下一秒重新同时占位两个文件
+            os.close(fd_json)
+            try:
+                os.remove(json_name)
+            except OSError:
+                pass
+            print(f'[提示] 输出文件 {csv_name} 已被占用，等待下一秒重新生成文件对（不会覆盖已有文件）...')
+            time.sleep(1.1)
+            continue
+        # 两个文件都占位成功：初始化内容（JSON=[]，CSV=UTF-8 BOM + 表头）
         failed = False
         try:
-            os.write(fd, b'[]')
-            os.fsync(fd)
+            os.write(fd_json, b'[]')
+            os.fsync(fd_json)
+            _init_csv_placeholder(fd_csv)
         except BaseException:
             failed = True
             raise
         finally:
-            os.close(fd)
+            os.close(fd_json)
+            os.close(fd_csv)
             if failed:
-                try:
-                    os.remove(filename)   # 初始化失败不留下坏的占位文件（先关句柄，Windows 才能删）
-                except OSError:
-                    pass
-        return filename
+                # 初始化失败不留下坏的占位文件（先关句柄，Windows 才能删）
+                for name in (json_name, csv_name):
+                    try:
+                        os.remove(name)
+                    except OSError:
+                        pass
+        return json_name, csv_name
+
+
+def _init_csv_placeholder(fd):
+    """CSV 占位文件初始化：UTF-8 BOM + 表头（BOM 只在整个文件最开头出现一次）"""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=OUTPUT_FIELDS)
+    writer.writeheader()
+    os.write(fd, b'\xef\xbb\xbf' + buffer.getvalue().encode('utf-8'))
+    os.fsync(fd)
 
 
 def find_latest_json():
@@ -473,45 +502,88 @@ def find_latest_json():
 
 
 def save_page(rows):
-    """把一页的数据立即追加写入 JSON 文件（标准 JSON 数组格式，不会内存溢出）。
-    原地追加；写入过程中发生异常（含 Ctrl+C）时，把文件回滚到写入前的合法状态，
-    再把原异常继续向外抛出（绝不吞掉 KeyboardInterrupt）"""
-    size_before = os.path.getsize(JSON_FILE) if os.path.exists(JSON_FILE) else 0
-    rollback_size = None      # 写入前的文件大小；None 表示写入还没开始，无需回滚
+    """把一页数据同时追加写入 JSON 和 CSV（同一份 rows，两文件字段/顺序/语义一致）。
+    写入前记录两个文件的长度；任一文件写入异常（含 Ctrl+C）时，两个文件都回滚到
+    写入前的状态，再把原异常继续向外抛出——绝不允许出现"JSON 有这一页、CSV 没有"
+    或相反。只有两个文件都成功后，调用方才会更新进度"""
+    json_size_before = os.path.getsize(JSON_FILE) if os.path.exists(JSON_FILE) else 0
+    csv_size_before = os.path.getsize(CSV_FILE) if os.path.exists(CSV_FILE) else 0
     try:
-        if size_before <= 2:
-            # 新文件/空文件：先建立合法的基础状态 []，再往里追加
-            with open(JSON_FILE, 'w', encoding='utf-8') as f:
-                f.write('[]')
+        _append_json(rows, json_size_before)
+        _append_csv(rows, csv_size_before)
+    except BaseException:
+        # 跨文件回滚：JSON 与 CSV 都恢复到本页写入前的大小（JSON 还需补回结尾的 ]）
+        _rollback_json(json_size_before)
+        _rollback_csv(csv_size_before)
+        raise
+
+
+def _append_json(rows, size_before):
+    """JSON 原地追加（内存只保留当前页）。异常由 save_page 统一回滚"""
+    if size_before <= 2:
+        # 新文件/空文件：先建立合法的基础状态 []，再往里追加
+        with open(JSON_FILE, 'w', encoding='utf-8') as f:
+            f.write('[]')
+            f.flush()
+            os.fsync(f.fileno())
+        append_size = 2
+    else:
+        append_size = size_before
+    with open(JSON_FILE, 'r+', encoding='utf-8') as f:
+        f.seek(append_size - 1)   # 覆盖掉结尾的 ]
+        for i, row in enumerate(rows):
+            # 已有数据时第一条也要逗号（覆盖掉了 ]）；空文件的第一条不加逗号
+            if i > 0 or append_size > 2:
+                f.write(',')
+            f.write(json.dumps(row, ensure_ascii=False))
+        f.write(']')              # 补回结尾的 ]
+        f.flush()
+        os.fsync(f.fileno())      # 强制写盘，防止意外断电丢数据
+
+
+def _append_csv(rows, size_before):
+    """CSV 原地追加一页 rows（csv.DictWriter 处理转义，内存只保留当前页）。
+    size_before <= 0 说明文件还没初始化（如续传旧版 JSON 没有配套 CSV），先补写 BOM+表头。
+    异常由 save_page 统一回滚"""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=OUTPUT_FIELDS)
+    if size_before <= 0:
+        writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    payload = buffer.getvalue().encode('utf-8')
+    with open(CSV_FILE, 'ab') as f:
+        if size_before <= 0:
+            f.write(b'\xef\xbb\xbf')   # BOM 只写在文件最开头
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _rollback_json(size):
+    """把 JSON 截断回写入前大小并补回结尾的 ]（恢复合法 JSON）"""
+    try:
+        if size > 0 and os.path.exists(JSON_FILE):
+            with open(JSON_FILE, 'r+', encoding='utf-8') as f:
+                f.truncate(size)
+                f.seek(size - 1)
+                f.write(']')
                 f.flush()
                 os.fsync(f.fileno())
-            rollback_size = 2
-        else:
-            rollback_size = size_before
+    except Exception:
+        pass   # 回滚本身失败不掩盖原异常
 
-        with open(JSON_FILE, 'r+', encoding='utf-8') as f:
-            f.seek(rollback_size - 1)   # 覆盖掉结尾的 ]
-            for i, row in enumerate(rows):
-                # 已有数据时第一条也要逗号（覆盖掉了 ]）；空文件的第一条不加逗号
-                if i > 0 or rollback_size > 2:
-                    f.write(',')
-                f.write(json.dumps(row, ensure_ascii=False))
-            f.write(']')                # 补回结尾的 ]
-            f.flush()
-            os.fsync(f.fileno())        # 强制写盘，防止意外断电丢数据
-    except BaseException:
-        # 局部回滚：截断回写入前的大小，补回结尾的 ]，恢复合法 JSON 后重新抛出原异常
-        try:
-            if rollback_size is not None and os.path.exists(JSON_FILE):
-                with open(JSON_FILE, 'r+', encoding='utf-8') as f:
-                    f.truncate(rollback_size)
-                    f.seek(rollback_size - 1)
-                    f.write(']')
-                    f.flush()
-                    os.fsync(f.fileno())
-        except Exception:
-            pass   # 回滚本身失败不掩盖原异常
-        raise
+
+def _rollback_csv(size):
+    """把 CSV 截断回写入前大小（CSV 追加不覆盖已有字节，截断即恢复）"""
+    try:
+        if os.path.exists(CSV_FILE):
+            with open(CSV_FILE, 'r+', encoding='utf-8') as f:
+                f.truncate(size)
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception:
+        pass   # 回滚本身失败不掩盖原异常
 
 
 def save_progress(page):
@@ -816,24 +888,25 @@ def fetch_batch(pages, cookie, executor):
 # ==================== 七、主程序 ====================
 
 def main():
-    global JSON_FILE, consecutive_403
+    global JSON_FILE, CSV_FILE, consecutive_403
 
-    # ---- 第一步：确定本次输出文件（时间戳命名，任务期间保持不变）----
+    # ---- 第一步：确定本次输出文件对（JSON+CSV 同基名，任务期间保持不变）----
     if RESUME:
         latest = find_latest_json()
         if latest:
             JSON_FILE = latest
-            print(f'断点续传：找到最近一次抓取文件 {JSON_FILE}')
+            CSV_FILE = os.path.splitext(latest)[0] + '.csv'   # 与 JSON 同基名的 CSV
+            print(f'断点续传：找到最近一次抓取文件 {JSON_FILE} / {CSV_FILE}')
         else:
-            JSON_FILE = build_json_filename()
+            JSON_FILE, CSV_FILE = build_output_files()
             print(f'断点续传：未找到与当前配置（PER_PAGE={PER_PAGE}，MAX_PAGE={MAX_PAGE}）匹配的历史文件，'
                   f'将新建文件从头开始')
             if os.path.exists(PROGRESS_FILE):
                 os.remove(PROGRESS_FILE)   # 旧进度是其他配置留下的，清理掉避免错位续传
     else:
-        JSON_FILE = build_json_filename()
+        JSON_FILE, CSV_FILE = build_output_files()
         reset_data_files()
-        print('已清理本次运行的进度状态，从第 1 页开始抓取。（历史时间戳 JSON 文件不会被删除）')
+        print('已清理本次运行的进度状态，从第 1 页开始抓取。（历史时间戳 JSON/CSV 文件不会被删除）')
 
     # ---- 第二步：启动信息 ----
     print('=' * 60)
@@ -843,7 +916,8 @@ def main():
     print(f'并发数量：{CONCURRENCY}')
     print(f'批次间隔：{SLEEP_MIN}~{SLEEP_MAX} 秒')
     print(f'断点续传：{"开（从上次进度继续）" if RESUME else "关（从头开始抓）"}')
-    print(f'输出文件：{JSON_FILE}')
+    print(f'JSON输出：{JSON_FILE}')
+    print(f'CSV输出：{CSV_FILE}')
     print('=' * 60)
 
     cookie = load_cookie()
@@ -965,7 +1039,7 @@ def main():
                     time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
 
     except KeyboardInterrupt:
-        print('\n已手动停止。已保存的数据仍在 JSON 文件中，重新运行脚本会从断点继续。')
+        print('\n已手动停止。已成功保存的 JSON / CSV 数据均保留，重新运行脚本会从断点继续。')
 
     if blocked_403:
         print('由于连续收到 403，程序已停止。')
@@ -974,7 +1048,9 @@ def main():
     elif login_expired:
         print('由于登录失效，程序已停止。更新 Cookie 后重新运行即可继续抓取。')
     elif finished:
-        print(f'全部完成！本次共抓取 {total_saved} 条数据，保存在 {JSON_FILE}')
+        print(f'全部完成！本次共抓取 {total_saved} 条数据')
+        print(f'JSON：{JSON_FILE}')
+        print(f'CSV ：{CSV_FILE}')
     else:
         print(f'本次运行结束（共保存 {total_saved} 条）。重新运行脚本可继续抓取。')
 
