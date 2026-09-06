@@ -4,9 +4,16 @@
 
 通过模拟浏览器请求 eMAG 后台 API 接口，循环翻页抓取海量商品数据（实测支持 21 万+ 条），支持多线程并发、断点续传、失败重试、登录失效检测，输出标准 JSON 文件。
 
-当前版本：**1.0.2**
+当前版本：**1.0.3**
 
 ## 版本日志
+
+### [v1.0.3](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.3)（2026-09-06）
+
+- 新增 CSV 输出，每次抓取同步生成 JSON 与 CSV 两种格式
+- JSON / CSV 使用相同时间戳基名和相同 21 个中文业务字段
+- CSV 使用 Excel 友好的 UTF-8 BOM 编码
+- CSV 按页增量写入，并与 JSON 保持页级一致
 
 ### [v1.0.2](https://github.com/bendankill/Scrapling_2.0_superhot/tree/v1.0.2)（2026-09-06）
 
